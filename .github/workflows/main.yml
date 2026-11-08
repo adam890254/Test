@@ -180,6 +180,58 @@ jobs:
           Write-Host "FDR Windows RDP is running."
           Write-Host "The session ends when GitHub stops the runner."
 
+          
+$ErrorActionPreference = "Stop"
+
+# Enable Remote Desktop
+Set-ItemProperty `
+  -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+  -Name "fDenyTSConnections" `
+  -Value 0
+
+# Start Remote Desktop service
+Set-Service -Name TermService -StartupType Automatic
+Start-Service -Name TermService
+
+# Enable firewall rules
+Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+# Create explicit inbound rule
+if (!(Get-NetFirewallRule -Name "FDR-RDP-3389" -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule `
+      -Name "FDR-RDP-3389" `
+      -DisplayName "FDR RDP TCP 3389" `
+      -Direction Inbound `
+      -Protocol TCP `
+      -LocalPort 3389 `
+      -Action Allow `
+      -Profile Any
+}
+
+# Verify registry and service
+$RdpDisabled = (Get-ItemProperty `
+  "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server").fDenyTSConnections
+
+if ($RdpDisabled -ne 0) {
+    throw "RDP registry configuration failed."
+}
+
+if ((Get-Service TermService).Status -ne "Running") {
+    throw "RDP service is not running."
+}
+
+# Verify listener
+$Listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+
+if (!$Listener) {
+    throw "RDP TCP 3389 listener is unavailable."
+}
+
+Write-Host "RDP SERVICE: RUNNING"
+Write-Host "RDP REGISTRY: ENABLED"
+Write-Host "RDP PORT: LISTENING"
+
+
           while ($true) {
             Start-Sleep -Seconds 60
             Write-Host "FDR RDP is still running: $(Get-Date)"
