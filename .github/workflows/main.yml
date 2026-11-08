@@ -9,16 +9,18 @@ permissions:
 
 jobs:
   windows-rdp:
+    name: FDR Live Windows RDP
     runs-on: windows-latest
     timeout-minutes: 350
 
     steps:
+      # 1. Create RDP user and enable Windows RDP
       - name: Configure Windows RDP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Configuring Windows RDP..."
+          Write-Host "Starting FDR Windows configuration"
 
           $Username = "FDRUser"
           $Chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*"
@@ -29,15 +31,14 @@ jobs:
 
           $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
 
-          $ExistingUser = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+          $User = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
 
-          if ($ExistingUser) {
+          if ($User) {
             Set-LocalUser -Name $Username -Password $SecurePassword
-          }
-          else {
+          } else {
             New-LocalUser -Name $Username `
               -Password $SecurePassword `
-              -Description "FDR Remote Desktop User"
+              -Description "FDR Remote Desktop Account"
           }
 
           Add-LocalGroupMember `
@@ -51,34 +52,42 @@ jobs:
             -Name "fDenyTSConnections" `
             -Value 0
 
-          # Start Remote Desktop service
-          Set-Service -Name TermService -StartupType Manual
+          # Start RDP service
+          Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService
 
-          # Enable RDP firewall rules
+          # Enable firewall
+          Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
+
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
             Set-NetFirewallRule -Enabled True -Profile Any
 
-          # Ensure Windows Firewall is enabled
-          Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
+          # Explicit RDP inbound rule
+          if (!(Get-NetFirewallRule -Name "FDR-RDP-3389" -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule `
+              -Name "FDR-RDP-3389" `
+              -DisplayName "FDR Remote Desktop TCP 3389" `
+              -Direction Inbound `
+              -Protocol TCP `
+              -LocalPort 3389 `
+              -Action Allow `
+              -Profile Any
+          }
 
-          # Save connection information
-          "RDP_USERNAME=$Username" >> $env:GITHUB_ENV
-
-          # Mask password in workflow logs
+          # Mask password in logs
           Write-Output "::add-mask::$Password"
 
-          # Show password in private workflow summary
-          # Anyone with access to this run may be able to read it.
-          "RDP_PASSWORD=$Password" >> $env:GITHUB_STEP_SUMMARY
-
-          "## FDR Windows RDP" >> $env:GITHUB_STEP_SUMMARY
+          # Save credentials in the private workflow summary
+          "## FDR RDP Credentials" >> $env:GITHUB_STEP_SUMMARY
           "Username: $Username" >> $env:GITHUB_STEP_SUMMARY
           "Password: $Password" >> $env:GITHUB_STEP_SUMMARY
-          "RDP Port: 3389" >> $env:GITHUB_STEP_SUMMARY
+          "Port: 3389" >> $env:GITHUB_STEP_SUMMARY
 
-          Write-Host "RDP configuration completed."
+          "RDP_USERNAME=$Username" >> $env:GITHUB_ENV
 
+          Write-Host "RDP user configured."
+
+      # 2. Install Tailscale
       - name: Install Tailscale
         shell: pwsh
         run: |
@@ -99,14 +108,15 @@ jobs:
             throw "Tailscale installation failed."
           }
 
-          $Service = Get-Service -Name Tailscale
+          $Service = Get-Service -Name Tailscale -ErrorAction Stop
 
           if ($Service.Status -ne "Running") {
             Start-Service -Name Tailscale
           }
 
-          Write-Host "Tailscale installed and service started."
+          Write-Host "Tailscale installed successfully."
 
+      # 3. Connect to your Tailscale network
       - name: Connect Tailscale
         shell: pwsh
         env:
@@ -115,19 +125,19 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "TAILSCALE_AUTHKEY secret is missing."
+            throw "Missing GitHub secret TAILSCALE_AUTHKEY."
           }
 
           $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           & $Tailscale up `
-            --authkey=$env:TAILSCALE_AUTHKEY `
-            --hostname=fdr-github-windows `
-            --accept-dns=true `
-            --unattended
+            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=fdr-github-windows" `
+            "--accept-dns=true" `
+            "--unattended"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed."
+            throw "Tailscale authentication failed."
           }
 
           Start-Sleep -Seconds 10
@@ -135,116 +145,102 @@ jobs:
           $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
 
           if (!$IP) {
-            throw "Tailscale IP unavailable."
+            throw "Tailscale IP not found."
           }
 
           "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV
 
+          "## Network Connection" >> $env:GITHUB_STEP_SUMMARY
           "Tailscale IP: $IP" >> $env:GITHUB_STEP_SUMMARY
 
-          Write-Host "Tailscale connected: $IP"
+          Write-Host "Tailscale IP: $IP"
 
-      - name: Verify RDP and Network
+      # 4. Verify RDP and network
+      - name: Verify RDP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Checking Remote Desktop..."
+          Write-Host "Checking RDP service..."
 
-          $Service = Get-Service TermService
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
 
-          if ($Service.Status -ne "Running") {
+          if ((Get-Service TermService).Status -ne "Running") {
             Start-Service TermService
           }
 
-          $Listener = Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
-            -ErrorAction SilentlyContinue
+          $Listener = $null
+
+          for ($i = 1; $i -le 15; $i++) {
+            $Listener = Get-NetTCPConnection `
+              -LocalPort 3389 `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
+            if ($Listener) {
+              break
+            }
+
+            Start-Sleep -Seconds 2
+          }
 
           if (!$Listener) {
             throw "RDP port 3389 is not listening."
           }
 
-          Write-Host "RDP PORT 3389: ACTIVE"
+          $Test = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (!$Test.TcpTestSucceeded) {
+            throw "Local RDP network test failed."
+          }
+
           Write-Host "RDP SERVICE: RUNNING"
+          Write-Host "RDP PORT: OPEN"
+          Write-Host "LOCAL NETWORK TEST: PASSED"
           Write-Host "TAILSCALE IP: $env:TAILSCALE_IP"
 
           "RDP Status: ACTIVE" >> $env:GITHUB_STEP_SUMMARY
-          "Computer: $env:COMPUTERNAME" >> $env:GITHUB_STEP_SUMMARY
-          "Network: Tailscale connected" >> $env:GITHUB_STEP_SUMMARY
+          "Port 3389: LISTENING" >> $env:GITHUB_STEP_SUMMARY
+          "Local test: PASSED" >> $env:GITHUB_STEP_SUMMARY
 
-      - name: Keep RDP Session Alive
+      # 5. Keep the GitHub runner active
+      - name: Keep FDR RDP Session Live
         shell: pwsh
         run: |
-          Write-Host "FDR Windows RDP is running."
-          Write-Host "The session ends when GitHub stops the runner."
+          $ErrorActionPreference = "Stop"
 
-          
-$ErrorActionPreference = "Stop"
-
-# Enable Remote Desktop
-Set-ItemProperty `
-  -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-  -Name "fDenyTSConnections" `
-  -Value 0
-
-# Start Remote Desktop service
-Set-Service -Name TermService -StartupType Automatic
-Start-Service -Name TermService
-
-# Enable firewall rules
-Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-# Create explicit inbound rule
-if (!(Get-NetFirewallRule -Name "FDR-RDP-3389" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule `
-      -Name "FDR-RDP-3389" `
-      -DisplayName "FDR RDP TCP 3389" `
-      -Direction Inbound `
-      -Protocol TCP `
-      -LocalPort 3389 `
-      -Action Allow `
-      -Profile Any
-}
-
-# Verify registry and service
-$RdpDisabled = (Get-ItemProperty `
-  "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server").fDenyTSConnections
-
-if ($RdpDisabled -ne 0) {
-    throw "RDP registry configuration failed."
-}
-
-if ((Get-Service TermService).Status -ne "Running") {
-    throw "RDP service is not running."
-}
-
-# Verify listener
-$Listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-
-if (!$Listener) {
-    throw "RDP TCP 3389 listener is unavailable."
-}
-
-Write-Host "RDP SERVICE: RUNNING"
-Write-Host "RDP REGISTRY: ENABLED"
-Write-Host "RDP PORT: LISTENING"
-      - name: Keep RDP Session Running
-        shell: pwsh
-        run: |
-          Write-Host "FDR RDP SESSION IS LIVE"
+          Write-Host "===================================="
+          Write-Host "FDR WINDOWS RDP SESSION IS RUNNING"
+          Write-Host "===================================="
 
           while ($true) {
-            $service = Get-Service TermService
+
+            $Service = Get-Service TermService
+
+            if ($Service.Status -ne "Running") {
+              Start-Service TermService
+            }
+
+            $Listener = Get-NetTCPConnection `
+              -LocalPort 3389 `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
             Write-Host "Time: $(Get-Date)"
-            Write-Host "RDP Service: $($service.Status)"
             Write-Host "Computer: $env:COMPUTERNAME"
+            Write-Host "RDP Service: $((Get-Service TermService).Status)"
+            Write-Host "RDP Port: $(if ($Listener) {'LISTENING'} else {'NOT LISTENING'})"
+            Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+            if (!$Listener) {
+              Write-Host "WARNING: RDP listener unavailable."
+            }
 
             Start-Sleep -Seconds 30
-          }
-
-          while ($true) {
-            Start-Sleep -Seconds 60
-            Write-Host "FDR RDP is still running: $(Get-Date)"
           }
