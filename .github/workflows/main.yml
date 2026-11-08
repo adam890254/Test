@@ -1,5 +1,5 @@
 
-name: FDR Windows 11 USA RDP - Complete Setup
+name: FDR Windows RDP
 
 on:
   workflow_dispatch:
@@ -7,343 +7,180 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: fdr-windows-rdp
-  cancel-in-progress: false
-
 jobs:
   windows-rdp:
-    runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 30
+    runs-on: windows-latest
+    timeout-minutes: 350
 
     steps:
-
-      # STEP 1: Download project
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      # STEP 2: Check Administrator Permissions
-      - name: Check Administrator
+      - name: Configure Windows RDP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          Write-Host "Configuring Windows RDP..."
 
-          $admin = $principal.IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator
-          )
+          $Username = "FDRUser"
+          $Chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*"
 
-          if (!$admin) {
-            throw "Runner must run with Administrator permissions."
+          $Password = -join (1..24 | ForEach-Object {
+            $Chars[(Get-Random -Maximum $Chars.Length)]
+          })
+
+          $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+
+          $ExistingUser = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+
+          if ($ExistingUser) {
+            Set-LocalUser -Name $Username -Password $SecurePassword
+          }
+          else {
+            New-LocalUser -Name $Username `
+              -Password $SecurePassword `
+              -Description "FDR Remote Desktop User"
           }
 
-          Write-Host "Administrator permissions: OK"
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $Username `
+            -ErrorAction SilentlyContinue
 
-      # STEP 3: Verify Windows 11
-      - name: Verify Windows 11
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
 
-          $os = Get-CimInstance Win32_OperatingSystem
-          $build = [int]$os.BuildNumber
+          # Start Remote Desktop service
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
 
-          Write-Host "Operating System: $($os.Caption)"
-          Write-Host "Version: $($os.Version)"
-          Write-Host "Build: $build"
+          # Enable RDP firewall rules
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Set-NetFirewallRule -Enabled True -Profile Any
 
-          if ($os.Caption -notmatch "Windows 11") {
-            throw "This is not Windows 11."
-          }
+          # Ensure Windows Firewall is enabled
+          Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
 
-          if ($build -lt 22000) {
-            throw "Windows 11 build verification failed."
-          }
+          # Save connection information
+          "RDP_USERNAME=$Username" >> $env:GITHUB_ENV
 
-          if ($os.Caption -notmatch "Pro|Enterprise|Education") {
-            throw "Windows edition cannot host Microsoft RDP."
-          }
+          # Mask password in workflow logs
+          Write-Output "::add-mask::$Password"
 
-          Write-Host "Windows 11 edition: OK"
+          # Show password in private workflow summary
+          # Anyone with access to this run may be able to read it.
+          "RDP_PASSWORD=$Password" >> $env:GITHUB_STEP_SUMMARY
 
-      # STEP 4: Verify 16 GB RAM
-      - name: Verify RAM
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+          "## FDR Windows RDP" >> $env:GITHUB_STEP_SUMMARY
+          "Username: $Username" >> $env:GITHUB_STEP_SUMMARY
+          "Password: $Password" >> $env:GITHUB_STEP_SUMMARY
+          "RDP Port: 3389" >> $env:GITHUB_STEP_SUMMARY
 
-          $computer = Get-CimInstance Win32_ComputerSystem
+          Write-Host "RDP configuration completed."
 
-          $ram = [math]::Round(
-            $computer.TotalPhysicalMemory / 1GB, 2
-          )
-
-          Write-Host "Installed RAM: $ram GB"
-
-          if ($ram -lt 16) {
-            throw "Minimum 16 GB RAM required."
-          }
-
-          Write-Host "RAM verification: OK"
-
-      # STEP 5: Verify Internet
-      - name: Internet Verification
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          foreach ($hostName in @(
-            "github.com",
-            "pkgs.tailscale.com",
-            "microsoft.com"
-          )) {
-            $result = Test-NetConnection `
-              -ComputerName $hostName `
-              -Port 443 `
-              -WarningAction SilentlyContinue
-
-            if (!$result.TcpTestSucceeded) {
-              throw "Internet connection failed: $hostName"
-            }
-
-            Write-Host "$hostName HTTPS connectivity: OK"
-          }
-
-      # STEP 6: Install Tailscale
       - name: Install Tailscale
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $service = Get-Service Tailscale `
-            -ErrorAction SilentlyContinue
+          $Installer = "$env:TEMP\tailscale-setup.exe"
 
-          if (!$service) {
-            $installer = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+            -OutFile $Installer
 
-            Invoke-WebRequest `
-              "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
-              -OutFile $installer
+          Start-Process -FilePath $Installer `
+            -ArgumentList "/quiet" -Wait
 
-            $process = Start-Process `
-              -FilePath $installer `
-              -ArgumentList "/quiet" `
-              -Wait -PassThru
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-            if ($process.ExitCode -ne 0) {
-              throw "Tailscale installation failed."
-            }
+          if (!(Test-Path $Tailscale)) {
+            throw "Tailscale installation failed."
           }
 
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $Service = Get-Service -Name Tailscale
 
-          if (!(Test-Path $ts)) {
-            throw "Tailscale executable missing."
+          if ($Service.Status -ne "Running") {
+            Start-Service -Name Tailscale
           }
 
-          Start-Service Tailscale
+          Write-Host "Tailscale installed and service started."
 
-          Write-Host "Tailscale installation: OK"
-
-      # STEP 7: Authenticate Tailscale
-      - name: Tailscale Authentication
+      - name: Connect Tailscale
         shell: pwsh
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace(
-            $env:TAILSCALE_AUTHKEY
-          )) {
-            throw "Add TAILSCALE_AUTHKEY to GitHub Secrets."
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY secret is missing."
           }
 
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          & $ts up `
-            "--auth-key=$env:TAILSCALE_AUTHKEY" `
-            "--hostname=fdr-windows-usa" `
-            "--accept-dns=true"
+          & $Tailscale up `
+            --authkey=$env:TAILSCALE_AUTHKEY `
+            --hostname=fdr-github-windows `
+            --accept-dns=true `
+            --unattended
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale authentication failed."
+            throw "Tailscale connection failed."
           }
 
-          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          Start-Sleep -Seconds 10
 
-          if (!$ip) {
-            throw "Tailscale IP not found."
+          $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if (!$IP) {
+            throw "Tailscale IP unavailable."
           }
 
-          "FDR_TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV
 
-          Write-Host "Tailscale connected successfully."
-          Write-Host "Private IP: $ip"
+          "Tailscale IP: $IP" >> $env:GITHUB_STEP_SUMMARY
 
-      # STEP 8: Generate Random Credentials
-      - name: Create Random RDP User
+          Write-Host "Tailscale connected: $IP"
+
+      - name: Verify RDP and Network
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $username = "FDR" + (
-            [guid]::NewGuid().ToString("N").Substring(0,8)
-          )
+          Write-Host "Checking Remote Desktop..."
 
-          $chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*"
+          $Service = Get-Service TermService
 
-          $bytes = New-Object byte[] 32
-          $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-          $rng.GetBytes($bytes)
-
-          $passwordChars = for ($i = 0; $i -lt 32; $i++) {
-            $chars[[int]$bytes[$i] % $chars.Length]
+          if ($Service.Status -ne "Running") {
+            Start-Service TermService
           }
 
-          $password = -join $passwordChars
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
-
-          New-LocalUser `
-            -Name $username `
-            -Password $secure `
-            -Description "FDR dedicated remote desktop account"
-
-          Add-LocalGroupMember `
-            -SID "S-1-5-32-555" `
-            -Member $username
-
-          # Encrypt credentials using Windows machine DPAPI.
-          Add-Type -AssemblyName System.Security
-
-          $folder = "$env:ProgramData\FDR-RDP"
-
-          New-Item -ItemType Directory -Path $folder -Force |
-            Out-Null
-
-          $payload = @{
-            Username = $username
-            Password = $password
-            Created = (Get-Date).ToUniversalTime().ToString("o")
-          } | ConvertTo-Json
-
-          $plainBytes = [Text.Encoding]::UTF8.GetBytes($payload)
-
-          $encrypted = [Security.Cryptography.ProtectedData]::Protect(
-            $plainBytes,
-            $null,
-            [Security.Cryptography.DataProtectionScope]::LocalMachine
-          )
-
-          [IO.File]::WriteAllBytes(
-            "$folder\credentials.dpapi",
-            $encrypted
-          )
-
-          icacls $folder /inheritance:r `
-            /grant:r "*S-1-5-18:(OI)(CI)F" `
-            "*S-1-5-32-544:(OI)(CI)F"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Credential file security failed."
-          }
-
-          Write-Host "RDP account created: $username"
-          Write-Host "Password saved in encrypted local storage."
-          Write-Host "Password is not printed in workflow logs."
-
-      # STEP 9: Enable RDP
-      - name: Configure Windows Remote Desktop
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name fDenyTSConnections `
-            -Value 0
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name UserAuthentication `
-            -Value 1
-
-          Set-Service TermService -StartupType Automatic
-
-          Start-Service TermService
-
-          # Disable broad built-in RDP firewall rules.
-          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
-            -ErrorAction SilentlyContinue |
-            Disable-NetFirewallRule
-
-          # Remove previous FDR rule.
-          Get-NetFirewallRule `
-            -DisplayName "FDR RDP Tailscale Only" `
-            -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
-
-          # Allow RDP only from Tailscale IPv4 range.
-          New-NetFirewallRule `
-            -DisplayName "FDR RDP Tailscale Only" `
-            -Direction Inbound `
-            -Protocol TCP `
+          $Listener = Get-NetTCPConnection `
             -LocalPort 3389 `
-            -RemoteAddress "100.64.0.0/10" `
-            -Action Allow `
-            -Profile Any
+            -State Listen `
+            -ErrorAction SilentlyContinue
 
-          Write-Host "RDP enabled."
-          Write-Host "Network Level Authentication enabled."
-          Write-Host "Firewall restricted to Tailscale."
+          if (!$Listener) {
+            throw "RDP port 3389 is not listening."
+          }
 
-      # STEP 10: Final Verification
-      - name: Final System Verification
+          Write-Host "RDP PORT 3389: ACTIVE"
+          Write-Host "RDP SERVICE: RUNNING"
+          Write-Host "TAILSCALE IP: $env:TAILSCALE_IP"
+
+          "RDP Status: ACTIVE" >> $env:GITHUB_STEP_SUMMARY
+          "Computer: $env:COMPUTERNAME" >> $env:GITHUB_STEP_SUMMARY
+          "Network: Tailscale connected" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Keep RDP Session Alive
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "FDR Windows RDP is running."
+          Write-Host "The session ends when GitHub stops the runner."
 
-          $rdp = Get-Service TermService
-
-          if ($rdp.Status -ne "Running") {
-            throw "RDP service is not running."
+          while ($true) {
+            Start-Sleep -Seconds 60
+            Write-Host "FDR RDP is still running: $(Get-Date)"
           }
-
-          $nla = Get-ItemPropertyValue `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name UserAuthentication
-
-          if ($nla -ne 1) {
-            throw "NLA is not enabled."
-          }
-
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $ts status
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale verification failed."
-          }
-
-          Write-Host "RDP service: OK"
-          Write-Host "NLA: OK"
-          Write-Host "Tailscale: OK"
-          Write-Host "Final verification successful."
-
-      # STEP 11: Display Connection Information
-      - name: FDR RDP Connection Details
-        shell: pwsh
-        run: |
-          Write-Host "===================================="
-          Write-Host "FDR WINDOWS RDP"
-          Write-Host "===================================="
-
-          Write-Host "Computer: $env:COMPUTERNAME"
-          Write-Host "Tailscale IP: $env:FDR_TAILSCALE_IP"
-          Write-Host "Username: Retrieve from local encrypted credentials"
-          Write-Host "Password: Retrieve from local encrypted credentials"
-          Write-Host "Port: 3389"
-          Write-Host "Security: Tailscale private network"
-          Write-Host "===================================="
