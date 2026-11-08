@@ -5,28 +5,49 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
       - name: Enable Remote Desktop
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       - name: Create RDP User
+        shell: pwsh
         run: |
-          $password = [System.Web.Security.Membership]::GeneratePassword(20, 4)
-          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDPUser" -Password $securePassword
-          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
-          echo "RDP_USERNAME=RDPUser" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          $chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*'
 
-      - name: Show Connection Information
+          $password = -join (1..24 | ForEach-Object {
+            $chars[(Get-Random -Maximum $chars.Length)]
+          })
+
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser `
+            -Name "RDPUser" `
+            -Password $securePassword `
+            -Description "Temporary RDP account"
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDPUser"
+
+          "RDP_USERNAME=RDPUser" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Verify Windows Setup
+        shell: pwsh
         run: |
-          Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "Runner IP: $((Invoke-RestMethod https://api.ipify.org))"
-          Write-Host "RDP setup completed."
+          Write-Host "Windows environment ready."
+          Write-Host "RDP user created successfully."
+          Write-Host "Runner computer: $env:COMPUTERNAME"
+          Write-Host "RDP port: 3389"
+          Write-Host "GitHub runner is temporary."
