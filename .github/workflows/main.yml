@@ -230,7 +230,19 @@ if (!$Listener) {
 Write-Host "RDP SERVICE: RUNNING"
 Write-Host "RDP REGISTRY: ENABLED"
 Write-Host "RDP PORT: LISTENING"
+      - name: Keep RDP Session Running
+        shell: pwsh
+        run: |
+          Write-Host "FDR RDP SESSION IS LIVE"
 
+          while ($true) {
+            $service = Get-Service TermService
+            Write-Host "Time: $(Get-Date)"
+            Write-Host "RDP Service: $($service.Status)"
+            Write-Host "Computer: $env:COMPUTERNAME"
+
+            Start-Sleep -Seconds 30
+          }
 
           while ($true) {
             Start-Sleep -Seconds 60
