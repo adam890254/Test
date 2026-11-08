@@ -1,53 +1,121 @@
 
-name: Windows RDP
+name: FDR Windows RDP
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  windows:
+  windows-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
-      - name: Enable Remote Desktop
+      - name: Configure Windows RDP
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Configuring Windows..."
+
+          $Username = "FDRUser"
+
+          $Chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*"
+
+          $Password = -join (1..24 | ForEach-Object {
+            $Chars[(Get-Random -Maximum $Chars.Length)]
+          })
+
+          $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+
+          if (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $Username -Password $SecurePassword
+          }
+          else {
+            New-LocalUser -Name $Username -Password $SecurePassword
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username -ErrorAction SilentlyContinue
+
           Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Value 0
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Create RDP User
+          "RDP_USERNAME=$Username" >> $env:GITHUB_ENV
+
+          # Store password as a masked Actions secret
+          Write-Output "::add-mask::$Password"
+          "RDP_PASSWORD=$Password" >> $env:GITHUB_ENV
+
+          Write-Host "Windows RDP configuration completed."
+
+      - name: Install Tailscale
         shell: pwsh
         run: |
-          $chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*'
+          $ErrorActionPreference = "Stop"
 
-          $password = -join (1..24 | ForEach-Object {
-            $chars[(Get-Random -Maximum $chars.Length)]
-          })
+          $Installer = "$env:TEMP\tailscale-setup.exe"
 
-          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+            -OutFile $Installer
 
-          New-LocalUser `
-            -Name "RDPUser" `
-            -Password $securePassword `
-            -Description "Temporary RDP account"
+          Start-Process -FilePath $Installer `
+            -ArgumentList "/quiet" -Wait
 
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "RDPUser"
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          "RDP_USERNAME=RDPUser" >> $env:GITHUB_ENV
-          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          if (!(Test-Path $Tailscale)) {
+            throw "Tailscale installation failed."
+          }
 
-      - name: Verify Windows Setup
+          Write-Host "Tailscale installed."
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "Missing TAILSCALE_AUTHKEY GitHub secret."
+          }
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $Tailscale up `
+            --authkey=$env:TAILSCALE_AUTHKEY `
+            --hostname=fdr-github-windows `
+            --accept-dns=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if (!$IP) {
+            throw "Could not obtain Tailscale IP."
+          }
+
+          "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale connection successful."
+
+      - name: Show Connection Status
         shell: pwsh
         run: |
-          Write-Host "Windows environment ready."
-          Write-Host "RDP user created successfully."
-          Write-Host "Runner computer: $env:COMPUTERNAME"
-          Write-Host "RDP port: 3389"
-          Write-Host "GitHub runner is temporary."
+          Write-Host "================================"
+          Write-Host "FDR WINDOWS RUNNER STATUS"
+          Write-Host "================================"
+          Write-Host "Computer: $env:COMPUTERNAME"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: Available in masked workflow environment"
+          Write-Host "RDP Port: 3389"
+          Write-Host "================================"
