@@ -1,246 +1,113 @@
-
-name: FDR Windows RDP
+name: RDP
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  windows-rdp:
-    name: FDR Live Windows RDP
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 3600
 
     steps:
-      # 1. Create RDP user and enable Windows RDP
-      - name: Configure Windows RDP
-        shell: pwsh
+      - name: Configure Core RDP Settings
         run: |
-          $ErrorActionPreference = "Stop"
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          Write-Host "Starting FDR Windows configuration"
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-          $Username = "FDRUser"
-          $Chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*"
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-          $Password = -join (1..24 | ForEach-Object {
-            $Chars[(Get-Random -Maximum $Chars.Length)]
-          })
-
-          $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-
-          $User = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
-
-          if ($User) {
-            Set-LocalUser -Name $Username -Password $SecurePassword
-          } else {
-            New-LocalUser -Name $Username `
-              -Password $SecurePassword `
-              -Description "FDR Remote Desktop Account"
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $Username `
-            -ErrorAction SilentlyContinue
-
-          # Enable Remote Desktop
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          # Start RDP service
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
-
-          # Enable firewall
-          Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
-
-          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
-            Set-NetFirewallRule -Enabled True -Profile Any
-
-          # Explicit RDP inbound rule
-          if (!(Get-NetFirewallRule -Name "FDR-RDP-3389" -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule `
-              -Name "FDR-RDP-3389" `
-              -DisplayName "FDR Remote Desktop TCP 3389" `
-              -Direction Inbound `
-              -Protocol TCP `
-              -LocalPort 3389 `
-              -Action Allow `
-              -Profile Any
-          }
-
-          # Mask password in logs
-          Write-Output "::add-mask::$Password"
-
-          # Save credentials in the private workflow summary
-          "## FDR RDP Credentials" >> $env:GITHUB_STEP_SUMMARY
-          "Username: $Username" >> $env:GITHUB_STEP_SUMMARY
-          "Password: $Password" >> $env:GITHUB_STEP_SUMMARY
-          "Port: 3389" >> $env:GITHUB_STEP_SUMMARY
-
-          "RDP_USERNAME=$Username" >> $env:GITHUB_ENV
-
-          Write-Host "RDP user configured."
-
-      # 2. Install Tailscale
       - name: Install Tailscale
-        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          $Installer = "$env:TEMP\tailscale-setup.exe"
-
-          Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
-            -OutFile $Installer
-
-          Start-Process -FilePath $Installer `
-            -ArgumentList "/quiet" -Wait
-
-          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (!(Test-Path $Tailscale)) {
-            throw "Tailscale installation failed."
-          }
-
-          $Service = Get-Service -Name Tailscale -ErrorAction Stop
-
-          if ($Service.Status -ne "Running") {
-            Start-Service -Name Tailscale
-          }
-
-          Write-Host "Tailscale installed successfully."
-
-      # 3. Connect to your Tailscale network
-      - name: Connect Tailscale
-        shell: pwsh
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: Establish Tailscale Connection
         run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "Missing GitHub secret TAILSCALE_AUTHKEY."
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
-          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $Tailscale up `
-            "--authkey=$env:TAILSCALE_AUTHKEY" `
-            "--hostname=fdr-github-windows" `
-            "--accept-dns=true" `
-            "--unattended"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale authentication failed."
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
           }
-
-          Start-Sleep -Seconds 10
-
-          $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
-
-          if (!$IP) {
-            throw "Tailscale IP not found."
-          }
-
-          "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV
-
-          "## Network Connection" >> $env:GITHUB_STEP_SUMMARY
-          "Tailscale IP: $IP" >> $env:GITHUB_STEP_SUMMARY
-
-          Write-Host "Tailscale IP: $IP"
-
-      # 4. Verify RDP and network
-      - name: Verify RDP
-        shell: pwsh
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
         run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "Checking RDP service..."
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          if ((Get-Service TermService).Status -ne "Running") {
-            Start-Service TermService
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
+          Write-Host "TCP connectivity successful!"
 
-          $Listener = $null
-
-          for ($i = 1; $i -le 15; $i++) {
-            $Listener = Get-NetTCPConnection `
-              -LocalPort 3389 `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-            if ($Listener) {
-              break
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if (!$Listener) {
-            throw "RDP port 3389 is not listening."
-          }
-
-          $Test = Test-NetConnection `
-            -ComputerName 127.0.0.1 `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
-
-          if (!$Test.TcpTestSucceeded) {
-            throw "Local RDP network test failed."
-          }
-
-          Write-Host "RDP SERVICE: RUNNING"
-          Write-Host "RDP PORT: OPEN"
-          Write-Host "LOCAL NETWORK TEST: PASSED"
-          Write-Host "TAILSCALE IP: $env:TAILSCALE_IP"
-
-          "RDP Status: ACTIVE" >> $env:GITHUB_STEP_SUMMARY
-          "Port 3389: LISTENING" >> $env:GITHUB_STEP_SUMMARY
-          "Local test: PASSED" >> $env:GITHUB_STEP_SUMMARY
-
-      # 5. Keep the GitHub runner active
-      - name: Keep FDR RDP Session Live
-        shell: pwsh
+      - name: Maintain Connection
         run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "===================================="
-          Write-Host "FDR WINDOWS RDP SESSION IS RUNNING"
-          Write-Host "===================================="
-
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-
-            $Service = Get-Service TermService
-
-            if ($Service.Status -ne "Running") {
-              Start-Service TermService
-            }
-
-            $Listener = Get-NetTCPConnection `
-              -LocalPort 3389 `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-            Write-Host "Time: $(Get-Date)"
-            Write-Host "Computer: $env:COMPUTERNAME"
-            Write-Host "RDP Service: $((Get-Service TermService).Status)"
-            Write-Host "RDP Port: $(if ($Listener) {'LISTENING'} else {'NOT LISTENING'})"
-            Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-
-            if (!$Listener) {
-              Write-Host "WARNING: RDP listener unavailable."
-            }
-
-            Start-Sleep -Seconds 30
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
