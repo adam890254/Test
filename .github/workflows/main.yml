@@ -1,121 +1,122 @@
+# ==========================================
+# FDR - WINDOWS 11 RDP AUTO SETUP
+# ==========================================
 
-name: FDR Windows RDP
+# Administrator check
+$currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
 
-on:
-  workflow_dispatch:
+if (!$principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+    Write-Host "ERROR: Run PowerShell as Administrator"
+    exit 1
+}
 
-permissions:
-  contents: read
+Write-Host "Starting FDR RDP Setup..." -ForegroundColor Cyan
 
-jobs:
-  windows-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 350
+# 1. Check Windows edition
+$edition = (Get-ComputerInfo).WindowsProductName
+Write-Host "Windows: $edition"
 
-    steps:
-      - name: Configure Windows RDP
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+if ($edition -notmatch "Pro|Enterprise|Education") {
+    Write-Host "Windows Home cannot host Microsoft's built-in RDP."
+    exit 1
+}
 
-          Write-Host "Configuring Windows..."
+# 2. Check hardware
+$ram = [math]::Round(
+    (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2
+)
+$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+$diskSize = [math]::Round($disk.Size / 1GB, 2)
 
-          $Username = "FDRUser"
+Write-Host "RAM: $ram GB"
+Write-Host "C Drive: $diskSize GB"
 
-          $Chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*"
+# 3. Generate random username
+$randomID = [guid]::NewGuid().ToString("N").Substring(0,8)
+$username = "FDR" + $randomID
 
-          $Password = -join (1..24 | ForEach-Object {
-            $Chars[(Get-Random -Maximum $Chars.Length)]
-          })
+# 4. Generate strong random password
+$chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*"
+$password = -join (1..24 | ForEach-Object {
+    $chars[[Security.Cryptography.RandomNumberGenerator]::GetInt32($chars.Length)]
+})
 
-          $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+# 5. Create local RDP account
+$securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-          if (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name $Username -Password $SecurePassword
-          }
-          else {
-            New-LocalUser -Name $Username -Password $SecurePassword
-          }
+New-LocalUser -Name $username `
+    -Password $securePassword `
+    -FullName "FDR Remote User" `
+    -Description "FDR RDP Account" `
+    -PasswordNeverExpires `
+    -AccountNeverExpires
 
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username -ErrorAction SilentlyContinue
+# Add user to Remote Desktop Users
+$rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
+Add-LocalGroupMember -Group $rdpGroup -Member $username
 
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0
+# 6. Enable Remote Desktop
+Set-ItemProperty `
+    -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+    -Name "fDenyTSConnections" -Value 0
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+# 7. Enable Network Level Authentication
+Set-ItemProperty `
+    -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+    -Name "UserAuthentication" -Value 1
 
-          "RDP_USERNAME=$Username" >> $env:GITHUB_ENV
+# 8. Start Remote Desktop service
+Set-Service -Name TermService -StartupType Automatic
+Start-Service -Name TermService
 
-          # Store password as a masked Actions secret
-          Write-Output "::add-mask::$Password"
-          "RDP_PASSWORD=$Password" >> $env:GITHUB_ENV
+# 9. Enable Windows RDP firewall rules
+Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          Write-Host "Windows RDP configuration completed."
+# 10. Install Tailscale if missing
+if (!(Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue)) {
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        winget install --id Tailscale.Tailscale -e --silent `
+            --accept-package-agreements --accept-source-agreements
+    } else {
+        Write-Host "Install Tailscale manually from tailscale.com"
+    }
+}
 
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
+# 11. Check Tailscale service
+$ts = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
 
-          $Installer = "$env:TEMP\tailscale-setup.exe"
+if ($ts) {
+    Set-Service -Name Tailscale -StartupType Automatic
+    Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+}
 
-          Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
-            -OutFile $Installer
+# 12. Check RDP listener
+Start-Sleep -Seconds 3
+$listener = Get-NetTCPConnection `
+    -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
 
-          Start-Process -FilePath $Installer `
-            -ArgumentList "/quiet" -Wait
+# 13. Display credentials
+Write-Host ""
+Write-Host "========== FDR RDP DETAILS ==========" -ForegroundColor Green
+Write-Host "Username: $username"
+Write-Host "Password: $password"
+Write-Host "RDP Port: 3389"
+Write-Host "RAM: $ram GB"
+Write-Host "Disk: $diskSize GB"
+Write-Host "RDP Listening: $([bool]$listener)"
 
-          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+Write-Host ""
+Write-Host "Tailscale status:"
+if (Get-Command tailscale -ErrorAction SilentlyContinue) {
+    tailscale status
+    tailscale ip -4
+} else {
+    Write-Host "Tailscale installation/sign-in still required."
+}
 
-          if (!(Test-Path $Tailscale)) {
-            throw "Tailscale installation failed."
-          }
-
-          Write-Host "Tailscale installed."
-
-      - name: Connect Tailscale
-        shell: pwsh
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "Missing TAILSCALE_AUTHKEY GitHub secret."
-          }
-
-          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $Tailscale up `
-            --authkey=$env:TAILSCALE_AUTHKEY `
-            --hostname=fdr-github-windows `
-            --accept-dns=true
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed."
-          }
-
-          $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
-
-          if (!$IP) {
-            throw "Could not obtain Tailscale IP."
-          }
-
-          "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV
-
-          Write-Host "Tailscale connection successful."
-
-      - name: Show Connection Status
-        shell: pwsh
-        run: |
-          Write-Host "================================"
-          Write-Host "FDR WINDOWS RUNNER STATUS"
-          Write-Host "================================"
-          Write-Host "Computer: $env:COMPUTERNAME"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host "Password: Available in masked workflow environment"
-          Write-Host "RDP Port: 3389"
-          Write-Host "================================"
+Write-Host ""
+Write-Host "Setup completed. Reboot if required."
+Write-Host "Keep your password private."
