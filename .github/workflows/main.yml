@@ -1,122 +1,137 @@
-# ==========================================
-# FDR - WINDOWS 11 RDP AUTO SETUP
-# ==========================================
+# FDR ALL-IN-ONE WINDOWS RDP + TAILSCALE
+# Run as Administrator on your own Windows 11 Pro VPS
 
-# Administrator check
-$currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+$ErrorActionPreference = "Continue"
 
-if (!$principal.IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator
-)) {
-    Write-Host "ERROR: Run PowerShell as Administrator"
-    exit 1
+Write-Host "=== FDR RDP AUTO CONFIGURATION ===" -ForegroundColor Cyan
+
+# 1. Administrator verification
+$admin = ([Security.Principal.WindowsPrincipal] `
+[Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+[Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (!$admin) {
+    throw "Please run PowerShell as Administrator"
 }
 
-Write-Host "Starting FDR RDP Setup..." -ForegroundColor Cyan
+# 2. Windows edition check
+$os = Get-CimInstance Win32_OperatingSystem
+Write-Host "OS: $($os.Caption)"
 
-# 1. Check Windows edition
-$edition = (Get-ComputerInfo).WindowsProductName
-Write-Host "Windows: $edition"
-
-if ($edition -notmatch "Pro|Enterprise|Education") {
-    Write-Host "Windows Home cannot host Microsoft's built-in RDP."
-    exit 1
+if ($os.Caption -notmatch "Pro|Enterprise|Education") {
+    throw "Windows Pro or supported Enterprise/Education edition required."
 }
 
-# 2. Check hardware
+# 3. Hardware verification
 $ram = [math]::Round(
-    (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2
+(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2
 )
 $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-$diskSize = [math]::Round($disk.Size / 1GB, 2)
 
 Write-Host "RAM: $ram GB"
-Write-Host "C Drive: $diskSize GB"
+Write-Host "Disk: $([math]::Round($disk.Size/1GB,2)) GB"
 
-# 3. Generate random username
-$randomID = [guid]::NewGuid().ToString("N").Substring(0,8)
-$username = "FDR" + $randomID
+# 4. Create random account
+$random = [guid]::NewGuid().ToString("N").Substring(0,10)
+$username = "FDR$random"
 
-# 4. Generate strong random password
 $chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*"
-$password = -join (1..24 | ForEach-Object {
+$password = -join (1..28 | ForEach-Object {
     $chars[[Security.Cryptography.RandomNumberGenerator]::GetInt32($chars.Length)]
 })
 
-# 5. Create local RDP account
-$securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+$secure = ConvertTo-SecureString $password -AsPlainText -Force
 
-New-LocalUser -Name $username `
-    -Password $securePassword `
-    -FullName "FDR Remote User" `
-    -Description "FDR RDP Account" `
-    -PasswordNeverExpires `
-    -AccountNeverExpires
+New-LocalUser -Name $username -Password $secure `
+-Description "FDR Remote Desktop User"
 
-# Add user to Remote Desktop Users
-$rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
-Add-LocalGroupMember -Group $rdpGroup -Member $username
+Add-LocalGroupMember -SID "S-1-5-32-555" -Member $username
 
-# 6. Enable Remote Desktop
+# 5. Enable Remote Desktop
 Set-ItemProperty `
-    -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-    -Name "fDenyTSConnections" -Value 0
+"HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+-Name fDenyTSConnections -Value 0
 
-# 7. Enable Network Level Authentication
 Set-ItemProperty `
-    -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-    -Name "UserAuthentication" -Value 1
+"HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+-Name UserAuthentication -Value 1
 
-# 8. Start Remote Desktop service
-Set-Service -Name TermService -StartupType Automatic
-Start-Service -Name TermService
+# 6. RDP service
+Set-Service TermService -StartupType Automatic
+Start-Service TermService
 
-# 9. Enable Windows RDP firewall rules
-Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+# 7. Firewall - allow RDP only through Tailscale
+New-NetFirewallRule -DisplayName "FDR RDP Tailscale Only" `
+-Direction Inbound -Protocol TCP -LocalPort 3389 `
+-RemoteAddress 100.64.0.0/10 -Action Allow `
+-Profile Any -ErrorAction SilentlyContinue
 
-# 10. Install Tailscale if missing
-if (!(Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue)) {
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        winget install --id Tailscale.Tailscale -e --silent `
-            --accept-package-agreements --accept-source-agreements
-    } else {
-        Write-Host "Install Tailscale manually from tailscale.com"
-    }
+# Disable broad built-in RDP inbound rules
+Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+-ErrorAction SilentlyContinue |
+Where-Object {$_.Direction -eq "Inbound"} |
+Disable-NetFirewallRule
+
+# 8. Install Tailscale
+$ts = Get-Service Tailscale -ErrorAction SilentlyContinue
+
+if (!$ts) {
+    $installer = "$env:TEMP\tailscale-setup.exe"
+
+    Invoke-WebRequest `
+    "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+    -OutFile $installer
+
+    Start-Process $installer -ArgumentList "/quiet" -Wait
 }
 
-# 11. Check Tailscale service
-$ts = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+# 9. Start Tailscale
+Set-Service Tailscale -StartupType Automatic `
+-ErrorAction SilentlyContinue
 
-if ($ts) {
-    Set-Service -Name Tailscale -StartupType Automatic
-    Start-Service -Name Tailscale -ErrorAction SilentlyContinue
-}
+Start-Service Tailscale -ErrorAction SilentlyContinue
 
-# 12. Check RDP listener
-Start-Sleep -Seconds 3
-$listener = Get-NetTCPConnection `
-    -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-
-# 13. Display credentials
+# 10. Authentication
 Write-Host ""
-Write-Host "========== FDR RDP DETAILS ==========" -ForegroundColor Green
+Write-Host "Tailscale authentication may be required."
+Write-Host "Open the Tailscale login window and authorize this machine."
+
+Start-Process "C:\Program Files\Tailscale\tailscale-ipn.exe" `
+-ErrorAction SilentlyContinue
+
+# 11. Wait for connection
+Start-Sleep -Seconds 8
+
+$tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+$tsIP = ""
+
+if (Test-Path $tsExe) {
+    $tsIP = (& $tsExe ip -4 2>$null | Select-Object -First 1)
+}
+
+# 12. Test RDP listener
+Start-Sleep -Seconds 3
+
+$listener = Get-NetTCPConnection `
+-LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+
+# 13. Final report
+Write-Host ""
+Write-Host "======= FDR RDP REPORT =======" -ForegroundColor Green
+
 Write-Host "Username: $username"
 Write-Host "Password: $password"
+Write-Host "Tailscale IP: $tsIP"
 Write-Host "RDP Port: 3389"
 Write-Host "RAM: $ram GB"
-Write-Host "Disk: $diskSize GB"
-Write-Host "RDP Listening: $([bool]$listener)"
+Write-Host "RDP Listener: $([bool]$listener)"
 
-Write-Host ""
-Write-Host "Tailscale status:"
-if (Get-Command tailscale -ErrorAction SilentlyContinue) {
-    tailscale status
-    tailscale ip -4
+if ($tsIP) {
+    Write-Host "Connect using: $tsIP"
 } else {
-    Write-Host "Tailscale installation/sign-in still required."
+    Write-Host "Tailscale login/connection pending."
 }
 
 Write-Host ""
-Write-Host "Setup completed. Reboot if required."
-Write-Host "Keep your password private."
+Write-Host "Save these credentials securely."
+Write-Host "FDR setup finished."
